@@ -1,0 +1,121 @@
+name: Auto create main PR on staging merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [staging]
+
+# 같은 head 브랜치에서 staging PR이 연속해서 머지될 때 발생할 수 있는 경합(race condition) 방지
+concurrency:
+  group: auto-main-pr-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create-main-pr:
+    # PR이 실제로 머지된 경우에만 실행 (단순 close 이벤트는 제외)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Create main-bound Draft PR
+        uses: actions/github-script@v7
+        with:
+          # 토큰 선택 우선순위: AUTO_PR_TOKEN(PAT)이 등록되어 있으면 사용, 없으면 GITHUB_TOKEN으로 fallback
+          # GITHUB_TOKEN을 사용하려면 Settings → Actions → General →
+          # "Allow GitHub Actions to create and approve pull requests" 토글이 켜져 있어야 동작
+          github-token: ${{ secrets.AUTO_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            // staging에 방금 머지된 PR 정보 추출
+            const pr = context.payload.pull_request;
+            const headBranch = pr.head.ref;
+
+            // ============ 스킵 조건 ============
+
+            // [1] head 브랜치가 staging/main 자체인 경우 (예: main → staging 정기 동기화 PR)
+            //     이런 PR은 feat 단위 변경이 아니므로 main으로 또 만들면 안 됨
+            if (headBranch === 'staging' || headBranch === 'main') {
+              core.info(`Skip: head=${headBranch} is a long-lived branch`);
+              return;
+            }
+
+            // [2] 같은 head 브랜치에서 main으로 향하는 오픈 PR이 이미 존재하는 경우
+            //     멱등성(idempotency) 보장: 동일 브랜치에 추가 커밋 후 staging에 또 머지되어도
+            //     중복 PR을 만들지 않고 기존 PR을 그대로 재사용
+            const existing = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${headBranch}`,
+              base: 'main',
+              state: 'open',
+            });
+            if (existing.data.length > 0) {
+              core.info(`Skip: main PR #${existing.data[0].number} already exists for ${headBranch}`);
+              await core.summary
+                .addHeading('Reusing existing main PR')
+                .addLink(`PR #${existing.data[0].number}`, existing.data[0].html_url)
+                .write();
+              return;
+            }
+
+            // ============ main 대상 Draft PR 생성 ============
+
+            // PR 본문 구성: main 향 자동 생성 PR임을 상단 마커로 즉시 식별 가능하게 함
+            // 체크리스트는 staging 검증 완료 여부를 명시적으로 확인하게 만들어 형식 승인을 방지
+            const body = [
+              '# 🚀 MAIN PR (auto-generated)',
+              '',
+              `> base: \`main\` / Draft PR auto-generated after staging merge`,
+              `> Source PR: #${pr.number}`,
+              '',
+              '## Checklist',
+              '- [ ] Verified on staging environment',
+              '- [ ] No regression',
+              '- [ ] Mark this PR as **Ready for review** after verification',
+            ].join('\n');
+
+            // Draft 상태로 생성: staging 검증이 끝나기 전에 실수로 main에 머지되는 것을 GitHub UI가 차단
+            const created = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: pr.title,
+              head: headBranch,
+              base: 'main',
+              body,
+              draft: true,
+            });
+
+            core.info(`Created Draft PR #${created.data.number}: ${created.data.html_url}`);
+
+            // ============ 리뷰어 자동 인계 (best effort) ============
+
+            // 원본 staging PR에 지정되어 있던 개별 리뷰어 + 팀 리뷰어를 그대로 새 PR에도 요청
+            // 권한 없는 리뷰어 등 GitHub API 호출이 실패해도 PR 생성 자체는 성공으로 처리하기 위해 try-catch
+            const reviewers = (pr.requested_reviewers || []).map(r => r.login);
+            const teamReviewers = (pr.requested_teams || []).map(t => t.slug);
+            if (reviewers.length > 0 || teamReviewers.length > 0) {
+              try {
+                await github.rest.pulls.requestReviewers({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: created.data.number,
+                  reviewers,
+                  team_reviewers: teamReviewers,
+                });
+                core.info(`Inherited reviewers: ${[...reviewers, ...teamReviewers.map(t => `@${t}`)].join(', ')}`);
+              } catch (e) {
+                core.warning(`Failed to inherit reviewers: ${e.message}`);
+              }
+            }
+
+            // ============ Job Summary 출력 (Actions 실행 화면 상단에 결과 카드로 표시) ============
+            await core.summary
+              .addHeading('🎉 Auto-generated Draft PR for main')
+              .addList([
+                `Source PR: #${pr.number}`,
+                `New PR: #${created.data.number}`,
+                `head: ${headBranch} → base: main`,
+              ])
+              .addLink('Open new PR', created.data.html_url)
+              .write();
