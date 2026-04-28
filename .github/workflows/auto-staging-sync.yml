@@ -1,0 +1,148 @@
+name: Auto sync main to staging on main merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# main으로 동시 머지가 들어올 때 sync 처리가 겹치지 않도록 직렬화
+concurrency:
+  group: auto-staging-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-to-staging:
+    # PR이 실제로 머지된 경우에만 (단순 close 제외)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Sync main to staging
+        uses: actions/github-script@v7
+        with:
+          # 토큰 우선순위: AUTO_PR_TOKEN(PAT) → GITHUB_TOKEN
+          # GITHUB_TOKEN 사용 시 Settings → Actions → General →
+          # "Allow GitHub Actions to create and approve pull requests" 토글 ON 필수
+          github-token: ${{ secrets.AUTO_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const headBranch = pr.head.ref;
+
+            // ============ 스킵 조건 ============
+
+            // [1] head 브랜치가 staging인 경우 (정상적인 staging → main 승격 PR)
+            //     이런 PR은 이미 staging 내용이 main으로 올라간 것이므로 다시 staging으로 돌릴 필요 없음
+            if (headBranch === 'staging') {
+              core.info(`Skip: head=${headBranch} is staging promotion PR, no back-sync needed`);
+              return;
+            }
+
+            // [2] main이 staging보다 앞서있는지 확인 (방금 머지한 커밋이 staging에 없는지 검증)
+            //     compare API: base=staging, head=main 기준으로 ahead_by가 0이면 동기화 불필요
+            const compare = await github.rest.repos.compareCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: 'staging',
+              head: 'main',
+            });
+
+            if (compare.data.ahead_by === 0) {
+              core.info('Skip: staging is already up-to-date with main');
+              await core.summary
+                .addHeading('✅ Already in sync')
+                .addRaw('staging is up-to-date with main (ahead_by=0)')
+                .write();
+              return;
+            }
+
+            core.info(`main is ahead of staging by ${compare.data.ahead_by} commit(s)`);
+
+            // ============ 기존 sync PR 재사용 (멱등성) ============
+
+            const existing = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:main`,
+              base: 'staging',
+              state: 'open',
+            });
+
+            let prNumber;
+            let prUrl;
+
+            if (existing.data.length > 0) {
+              prNumber = existing.data[0].number;
+              prUrl = existing.data[0].html_url;
+              core.info(`Reusing existing sync PR #${prNumber}`);
+            } else {
+              // ============ main → staging 동기화 PR 생성 ============
+
+              const body = [
+                '# 🔄 SYNC PR (auto-generated)',
+                '',
+                `> base: \`staging\` / Auto back-sync after main merge`,
+                `> Source PR: #${pr.number}`,
+                `> Commits to sync: ${compare.data.ahead_by}`,
+                '',
+                '## Checklist',
+                '- [ ] No merge conflicts',
+                '- [ ] Auto-merge succeeded',
+                '- [ ] If auto-merge failed, resolve and merge manually',
+              ].join('\n');
+
+              const created = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Sync to staging: ${pr.title}`,
+                head: 'main',
+                base: 'staging',
+                body,
+              });
+
+              prNumber = created.data.number;
+              prUrl = created.data.html_url;
+              core.info(`Created sync PR #${prNumber}: ${prUrl}`);
+            }
+
+            // ============ staging에 자동 머지 시도 (best effort) ============
+
+            // 머지 실패 케이스: 충돌, 브랜치 보호룰의 필수 리뷰/체크 미통과 등
+            // 실패해도 PR은 남으므로 사람이 수동 처리 가능
+            try {
+              const mergeResult = await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                merge_method: 'merge',
+                commit_title: `Sync main to staging (#${prNumber})`,
+              });
+
+              core.info(`✅ Auto-merged sync PR #${prNumber} into staging`);
+
+              await core.summary
+                .addHeading('🎉 main → staging sync completed')
+                .addList([
+                  `Source PR: #${pr.number}`,
+                  `Sync PR: #${prNumber}`,
+                  `Merged commits: ${compare.data.ahead_by}`,
+                  `Merge SHA: ${mergeResult.data.sha}`,
+                ])
+                .addLink('Open sync PR', prUrl)
+                .write();
+
+            } catch (e) {
+              core.warning(`Auto-merge failed: ${e.message}`);
+
+              await core.summary
+                .addHeading('⚠️ Auto-merge failed — manual action required')
+                .addList([
+                  `Source PR: #${pr.number}`,
+                  `Sync PR: #${prNumber}`,
+                  `Reason: ${e.message}`,
+                ])
+                .addRaw('Please open the sync PR, resolve conflicts (if any), and merge manually.')
+                .addLink('Open sync PR', prUrl)
+                .write();
+            }
